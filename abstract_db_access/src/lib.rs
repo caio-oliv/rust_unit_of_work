@@ -1,96 +1,46 @@
-use async_trait::async_trait;
-
-pub trait DbAccess {
-    type Connection;
-}
+#![allow(async_fn_in_trait)]
 
 pub trait Transactor {
     type Transaction<'t>: TransactionUnit;
 }
 
-#[async_trait]
-pub trait DbUnit: DbAccess + Transactor {
+pub trait ConnectionUnit: Transactor {
+    type TransactionError;
+
     /// Creates a new transaction.
-    async fn transaction<'s>(&'s mut self) -> Result<Self::Transaction<'s>, RepositoryError>;
+    async fn transaction(&mut self) -> Result<Self::Transaction<'_>, Self::TransactionError>;
 }
 
-#[async_trait]
-pub trait TransactionUnit: DbAccess + Transactor {
-    async fn commit(self) -> Result<(), RepositoryError>;
-    async fn rollback(self) -> Result<(), RepositoryError>;
+pub trait TransactionUnit {
+    type CommitError;
+    type RollbackError;
+
+    async fn commit(self) -> Result<(), Self::CommitError>;
+    async fn rollback(self) -> Result<(), Self::RollbackError>;
 }
 
-#[async_trait]
-pub trait SavePoint: TransactionUnit + Sized {
+pub trait SavePoint: TransactionUnit + Transactor {
+    type SavePointError;
+
     async fn save_point<'s>(
         &'s mut self,
         name: &str,
-    ) -> Result<Self::Transaction<'s>, RepositoryError>;
-
-    /// Returns the nested level
-    fn depth(&self) -> u32;
+    ) -> Result<Self::Transaction<'s>, Self::SavePointError>;
 }
 
-#[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]
-pub struct TransactionState {
-    /// Indicates if transaction is open
-    open: bool,
-    /// Determines the transaction depth level
-    ///
-    /// Level 0 is the first
-    depth: u32,
+pub trait SavePointUnit {
+    type RollbackToError;
+    type ReleaseError;
+
+    async fn rollback_to(self) -> Result<(), Self::RollbackToError>;
+    async fn release(self) -> Result<(), Self::ReleaseError>;
 }
 
-impl TransactionState {
-    #[inline]
-    pub fn new() -> Self {
-        Self::default()
-    }
+#[cfg(feature = "postgres_tokio")]
+pub mod postgres_tokio;
 
-    #[inline]
-    pub fn from_open_transaction(depth: u32) -> Self {
-        Self { open: true, depth }
-    }
+#[cfg(feature = "postgres_sqlx")]
+pub mod postgres_sqlx;
 
-    /// Indicates if transaction is open
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    /// Transaction depth level
-    pub fn depth(&self) -> u32 {
-        self.depth
-    }
-}
-
-pub type UnknownError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-#[cfg(any(feature = "pg_tokio", feature = "pg_deadpool"))]
-use tokio_postgres::error::DbError;
-
-#[derive(Debug)]
-pub enum RepositoryError {
-    #[cfg(any(feature = "pg_tokio", feature = "pg_deadpool"))]
-    TokioPostgres(DbError),
-    Unknown(UnknownError),
-}
-
-#[cfg(any(feature = "pg_tokio", feature = "pg_deadpool"))]
-impl From<tokio_postgres::Error> for RepositoryError {
-    fn from(err: tokio_postgres::Error) -> Self {
-        if let Some(db_err) = err.as_db_error() {
-            return RepositoryError::TokioPostgres(db_err.clone());
-        }
-
-        RepositoryError::Unknown(err.into())
-    }
-}
-
-#[cfg(feature = "pg_tokio")]
-pub mod pg_tokio;
-
-#[cfg(feature = "pg_deadpool")]
-pub mod pg_deadpool;
-
-#[cfg(feature = "sqlx")]
-pub mod sqlx;
+#[cfg(all(feature = "postgres_tokio", feature = "postgres_sqlx"))]
+compile_error!("features `postgres_tokio` and `postgres_sqlx` are mutually exclusive");

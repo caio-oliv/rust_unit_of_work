@@ -1,11 +1,13 @@
-use abstract_db_access::{
-    pg_deadpool::{PgTrxUnit, PgUnit},
-    DbAccess, DbUnit, RepositoryError, TransactionUnit,
-};
-use async_trait::async_trait;
-use utilities::connection;
+use core::future::Future;
 
-#[derive(Debug, Clone, PartialEq)]
+use abstract_db_access::{
+    postgres_tokio::{PgError, PgUnit},
+    ConnectionUnit, TransactionUnit,
+};
+use tokio_postgres::GenericClient;
+use utilities::{connection, database};
+
+#[derive(Debug, PartialEq)]
 struct User {
     id: uuid::Uuid,
     name: String,
@@ -22,141 +24,124 @@ impl From<tokio_postgres::Row> for User {
     }
 }
 
-#[async_trait]
-trait UserRepository: DbAccess {
-    async fn insert(&mut self, user: User) -> Result<(), RepositoryError>;
-    async fn find(&self, id: uuid::Uuid) -> Result<Option<User>, RepositoryError>;
-}
-
-#[async_trait]
-impl UserRepository for PgUnit {
-    async fn insert(&mut self, user: User) -> Result<(), RepositoryError> {
-        self.query(
+async fn insert_user(client: &impl GenericClient, user: &User) -> Result<(), PgError> {
+    client
+        .query(
             "INSERT INTO public.user (id, name, email) VALUES ($1, $2, $3)",
             &[&user.id, &user.name, &user.email],
         )
         .await?;
-        Ok(())
+    Ok(())
+}
+
+async fn find_user(client: &impl GenericClient, id: uuid::Uuid) -> Result<Option<User>, PgError> {
+    let row = client
+        .query_opt(
+            "SELECT (id, name, email) FROM public.user WHERE user.id = $1",
+            &[&id],
+        )
+        .await?;
+
+    Ok(row.map(User::from))
+}
+
+trait UserRepository {
+    async fn insert(&self, user: &User) -> Result<(), PgError>;
+    async fn find(&self, id: uuid::Uuid) -> Result<Option<User>, PgError>;
+}
+
+impl<C: GenericClient> UserRepository for C {
+    fn insert(&self, user: &User) -> impl Future<Output = Result<(), PgError>> {
+        insert_user(self, user)
     }
 
-    async fn find(&self, id: uuid::Uuid) -> Result<Option<User>, RepositoryError> {
-        let row = self
-            .query_opt(
-                "SELECT (id, name, email) FROM public.user WHERE user.id = $1",
-                &[&id],
-            )
-            .await?;
-
-        Ok(row.map(User::from))
+    fn find(&self, id: uuid::Uuid) -> impl Future<Output = Result<Option<User>, PgError>> {
+        find_user(self, id)
     }
 }
 
-#[async_trait]
-impl<'t> UserRepository for PgTrxUnit<'t> {
-    async fn insert(&mut self, user: User) -> Result<(), RepositoryError> {
-        self.client
-            .query(
-                "INSERT INTO public.user (id, name, email) VALUES ($1, $2, $3)",
-                &[&user.id, &user.name, &user.email],
-            )
-            .await?;
-        Ok(())
-    }
+async fn multi_repo_transaction(unit: &mut PgUnit, user: &User) -> Result<(), PgError> {
+    // TODO: improve example
+    let trx = ConnectionUnit::transaction(unit).await?;
 
-    async fn find(&self, id: uuid::Uuid) -> Result<Option<User>, RepositoryError> {
-        let row = self
-            .client
-            .query_opt(
-                "SELECT (id, name, email) FROM public.user WHERE user.id = $1",
-                &[&id],
-            )
-            .await?;
+    UserRepository::insert(&trx, user).await?;
 
-        Ok(row.map(User::from))
-    }
-}
-
-async fn multi_repo_transaction(mut unit: PgUnit, user: User) -> Result<(), RepositoryError> {
-    let mut trx = DbUnit::transaction(&mut unit).await.unwrap();
-
-    UserRepository::insert(&mut trx, user.clone())
-        .await
-        .unwrap();
-
-    trx.commit().await.unwrap();
+    trx.commit().await?;
 
     Ok(())
 }
 
-async fn multi_repo(mut unit: PgUnit, user: User) -> Result<(), RepositoryError> {
-    UserRepository::insert(&mut unit, user.clone())
-        .await
-        .unwrap();
+async fn multi_repo(unit: &PgUnit, user: &User) -> Result<(), PgError> {
+    // TODO: improve example
+    UserRepository::insert(unit, user).await?;
 
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn generic_function<Unit, Trx>(mut unit: Unit, user: User) -> Result<(), RepositoryError>
+async fn generic_function<Unit, Trx>(unit: &mut Unit, user: &User) -> Result<(), PgError>
 where
-    for<'t> Unit: DbUnit<Transaction<'t> = Trx>,
+    Unit: for<'trx> ConnectionUnit<Transaction<'trx> = Trx, TransactionError = PgError>,
     Unit: UserRepository,
-    Trx: TransactionUnit,
+    Trx: TransactionUnit<CommitError = PgError, RollbackError = PgError>,
     Trx: UserRepository,
 {
-    let mut trx = unit.transaction().await.unwrap();
+    let trx = unit.transaction().await?;
 
-    UserRepository::insert(&mut trx, user.clone())
-        .await
-        .unwrap();
+    UserRepository::insert(&trx, user).await?;
 
-    trx.commit().await.unwrap();
+    trx.commit().await?;
 
-    let restored_user = UserRepository::find(&mut unit, user.id).await.unwrap();
+    let restored_user = UserRepository::find(unit, user.id).await?;
 
-    assert_eq!(restored_user, Some(user));
+    assert_eq!(restored_user.as_ref(), Some(user));
 
     Ok(())
 }
 
-async fn setup_db(pool: &deadpool_postgres::Pool) {
-    let mut client = pool.get().await.unwrap();
-    let trx = client.transaction().await.unwrap();
-    trx.client
-        .batch_execute(concat!(
-            "DROP SCHEMA IF EXISTS public CASCADE;\n",
-            "CREATE SCHEMA IF NOT EXISTS public;\n",
-            "SET search_path TO public;\n",
-            include_str!("dbschema.sql")
-        ))
-        .await
-        .unwrap();
-    trx.commit().await.unwrap();
+fn make_user(id: u32) -> User {
+    User {
+        id: uuid::Uuid::now_v7(),
+        email: format!("rustac{id}@email.com"),
+        name: format!("Rustacean {id}"),
+    }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut users = (0..).map(|idx| User {
-        id: uuid::Uuid::new_v4(),
-        email: format!("rustac{idx}@email.com"),
-        name: format!("Rustacean {idx}"),
-    });
+    let mut users_iter = (0..).map(make_user);
 
     let pool = connection::create_pg_deadpool();
 
-    setup_db(&pool).await;
+    const SETUP_DB_COMMAND: &str = concat!(
+        "DROP SCHEMA IF EXISTS public CASCADE;\n",
+        "CREATE SCHEMA IF NOT EXISTS public;\n",
+        "SET search_path TO public;\n",
+        include_str!("dbschema.sql")
+    );
 
-    let client = pool.get().await.unwrap();
-    multi_repo(client, users.next().unwrap().clone())
-        .await
-        .unwrap();
+    database::deadpool_setup_schema(&pool, SETUP_DB_COMMAND).await;
 
-    let client = pool.get().await.unwrap();
-    multi_repo_transaction(client, users.next().unwrap().clone())
-        .await
-        .unwrap();
+    {
+        let client = pool.get().await.unwrap();
+        multi_repo(&client, &users_iter.next().unwrap())
+            .await
+            .unwrap();
+    }
+
+    {
+        let mut client = pool.get().await.unwrap();
+        multi_repo_transaction(&mut client, &users_iter.next().unwrap())
+            .await
+            .unwrap();
+    }
 
     // NOTE: HRTB issue
-    // let client = pool.get().await.unwrap();
-    // generic_function(client, user.clone()).await.unwrap();
+    // {
+    //     let user = users_iter.next().unwrap();
+
+    //     let mut client = pool.get().await.unwrap();
+    //     let unit: &mut PgUnit = client.as_mut();
+
+    //     generic_function(unit, &user).await.unwrap();
+    // }
 }

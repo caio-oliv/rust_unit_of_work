@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 
-set -o errexit;
+set -e;
+
+if [ ! -f '.env' ]; then
+	echo "missing '.env' file in project root directory" 1>&2;
+	exit -1;
+fi
 
 export $(grep -v '^#' .env | xargs);
 
 cargo test --tests;
 
-cargo run --example pg_deadpool --features=pg_deadpool;
+cargo run --example pg_deadpool --features=postgres_tokio;
 
-cargo run --example sqlx --features=sqlx;
+cargo run --example sqlx --features=postgres_sqlx;

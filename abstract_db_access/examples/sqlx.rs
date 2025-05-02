@@ -1,10 +1,8 @@
 use abstract_db_access::{
-    sqlx::{SqlxTrxUnit, SqlxUnit},
-    DbAccess, DbUnit, RepositoryError, TransactionUnit,
+    postgres_sqlx::{PgError, PgTrxUnit, PgUnit},
+    ConnectionUnit, TransactionUnit,
 };
-use async_trait::async_trait;
-use sqlx::Executor;
-use utilities::connection;
+use utilities::{connection, database};
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 struct User {
@@ -13,36 +11,33 @@ struct User {
     email: String,
 }
 
-#[async_trait]
-trait UserRepository: DbAccess {
-    async fn insert(&mut self, user: User) -> Result<(), RepositoryError>;
-    async fn find(&mut self, id: uuid::Uuid) -> Result<Option<User>, RepositoryError>;
+trait UserRepository {
+    async fn insert(&mut self, user: &User) -> Result<(), PgError>;
+    async fn find(&mut self, id: uuid::Uuid) -> Result<Option<User>, PgError>;
 }
 
-async fn insert_user<'e, E>(executor: E, user: User) -> Result<(), RepositoryError>
+async fn insert_user<'e, E>(executor: E, user: &User) -> Result<(), PgError>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    E: sqlx::PgExecutor<'e>,
 {
     sqlx::query("INSERT INTO public.user (id, name, email) VALUES ($1, $2, $3)")
         .bind(user.id)
-        .bind(user.name)
-        .bind(user.email)
+        .bind(&user.name)
+        .bind(&user.email)
         .execute(executor)
-        .await
-        .unwrap();
+        .await?;
     Ok(())
 }
 
-async fn find_user<'e, E>(executor: E, id: uuid::Uuid) -> Result<Option<User>, RepositoryError>
+async fn find_user<'e, E>(executor: E, id: uuid::Uuid) -> Result<Option<User>, PgError>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    E: sqlx::PgExecutor<'e>,
 {
     if let Some(user) =
         sqlx::query_as::<_, User>("SELECT (id, name, email) FROM public.user WHERE user.id = $1")
             .bind(id)
             .fetch_optional(executor)
-            .await
-            .unwrap()
+            .await?
     {
         return Ok(Some(user));
     }
@@ -50,108 +45,103 @@ where
     Ok(None)
 }
 
-#[async_trait]
-impl UserRepository for SqlxUnit<sqlx::Postgres> {
-    async fn insert(&mut self, user: User) -> Result<(), RepositoryError> {
+impl UserRepository for PgUnit {
+    async fn insert(&mut self, user: &User) -> Result<(), PgError> {
         insert_user(self, user).await
     }
 
-    async fn find(&mut self, id: uuid::Uuid) -> Result<Option<User>, RepositoryError> {
+    async fn find(&mut self, id: uuid::Uuid) -> Result<Option<User>, PgError> {
         find_user(self, id).await
     }
 }
 
-#[async_trait]
-impl<'t> UserRepository for SqlxTrxUnit<'t, sqlx::Postgres> {
-    async fn insert(&mut self, user: User) -> Result<(), RepositoryError> {
-        insert_user(self, user).await
+impl UserRepository for PgTrxUnit<'_> {
+    async fn insert(&mut self, user: &User) -> Result<(), PgError> {
+        insert_user(self.as_mut(), user).await
     }
 
-    async fn find(&mut self, id: uuid::Uuid) -> Result<Option<User>, RepositoryError> {
-        find_user(self, id).await
+    async fn find(&mut self, id: uuid::Uuid) -> Result<Option<User>, PgError> {
+        find_user(self.as_mut(), id).await
     }
 }
 
-// async fn multi_repo_transaction(
-//     mut unit: SqlxUnit<sqlx::Postgres>,
-//     user: User,
-// ) -> Result<(), RepositoryError> {
-//     let mut trx = DbUnit::transaction(&mut unit).await.unwrap();
+async fn multi_repo_transaction(unit: &mut PgUnit, user: &User) -> Result<(), PgError> {
+    // TODO: improve example
+    let mut trx = PgUnit::transaction(unit).await?;
 
-//     UserRepository::insert(&mut trx, user).await.unwrap();
+    UserRepository::insert(&mut trx, user).await?;
 
-//     trx.commit().await.unwrap();
+    trx.commit().await?;
 
-//     Ok(())
-// }
+    Ok(())
+}
 
-async fn multi_repo(mut unit: SqlxUnit<sqlx::Postgres>, user: User) -> Result<(), RepositoryError> {
-    UserRepository::insert(&mut unit, user).await.unwrap();
+async fn multi_repo(unit: &mut PgUnit, user: &User) -> Result<(), PgError> {
+    // TODO: improve example
+    UserRepository::insert(unit, user).await?;
 
     Ok(())
 }
 
 #[allow(dead_code)]
-async fn generic_function<Unit, Trx>(mut unit: Unit, user: User) -> Result<(), RepositoryError>
+async fn generic_function<Unit, Trx>(unit: &mut Unit, user: &User) -> Result<(), PgError>
 where
-    for<'t> Unit: DbUnit<Transaction<'t> = Trx>,
+    Unit: for<'trx> ConnectionUnit<Transaction<'trx> = Trx, TransactionError = PgError>,
     Unit: UserRepository,
-    Trx: TransactionUnit,
+    Trx: TransactionUnit<CommitError = PgError, RollbackError = PgError>,
     Trx: UserRepository,
 {
-    let mut trx = unit.transaction().await.unwrap();
+    let mut trx = unit.transaction().await?;
 
-    UserRepository::insert(&mut trx, user.clone())
-        .await
-        .unwrap();
+    UserRepository::insert(&mut trx, user).await.unwrap();
 
     trx.commit().await.unwrap();
 
-    let restored_user = UserRepository::find(&mut unit, user.id).await.unwrap();
+    let restored_user = UserRepository::find(unit, user.id).await.unwrap();
 
-    assert_eq!(restored_user, Some(user));
+    assert_eq!(restored_user.as_ref(), Some(user));
 
     Ok(())
 }
 
-async fn setup_db(pool: &sqlx::PgPool) {
-    let mut client = pool.acquire().await.unwrap();
-
-    client
-        .execute(concat!(
-            "DROP SCHEMA IF EXISTS public CASCADE;\n",
-            "CREATE SCHEMA IF NOT EXISTS public;\n",
-            "SET search_path TO public;\n",
-            include_str!("dbschema.sql")
-        ))
-        .await
-        .unwrap();
+fn make_user(id: u32) -> User {
+    User {
+        id: uuid::Uuid::now_v7(),
+        email: format!("rustac{id}@email.com"),
+        name: format!("Rustacean {id}"),
+    }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut users = (0..).map(|idx| User {
-        id: uuid::Uuid::new_v4(),
-        email: format!("rustac{idx}@email.com"),
-        name: format!("Rustacean {idx}"),
-    });
+    let mut users_iter = (0..).map(make_user);
 
     let pool = connection::create_sqlx_pool().await;
 
-    setup_db(&pool).await;
+    const SETUP_DB_COMMAND: &str = concat!(
+        "DROP SCHEMA IF EXISTS public CASCADE;\n",
+        "CREATE SCHEMA IF NOT EXISTS public;\n",
+        "SET search_path TO public;\n",
+        include_str!("dbschema.sql")
+    );
 
-    let client = pool.acquire().await.unwrap();
+    database::sqlx_setup_schema(&pool, SETUP_DB_COMMAND).await;
 
-    multi_repo(client, users.next().unwrap().clone())
-        .await
-        .unwrap();
+    let mut client = pool.acquire().await.unwrap();
 
-    // let client = pool.acquire().await.unwrap();
-    // multi_repo_transaction(client, users.next().unwrap().clone())
-    //     .await
-    //     .unwrap();
+    {
+        let user = users_iter.next().unwrap();
+        multi_repo(&mut client, &user).await.unwrap();
+    }
+
+    {
+        let user = users_iter.next().unwrap();
+        multi_repo_transaction(&mut client, &user).await.unwrap();
+    }
 
     // NOTE: HRTB issue
-    // let client = pool.acquire().await.unwrap();
-    // generic_function(client, user.clone()).await.unwrap();
+    // {
+    //     let conn: &mut PgUnit = &mut client;
+    //     generic_function(conn, &user).await.unwrap();
+    // }
 }

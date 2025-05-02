@@ -13,45 +13,36 @@ path = "src/lib.rs"
 
 [features]
 default = []
-pg_tokio = [
-	"dep:tokio-postgres"
-]
-pg_deadpool = [
-	"dep:tokio-postgres",
-	"dep:deadpool-postgres"
-]
-sqlx = [
-	"dep:sqlx-core"
-]
+postgres_tokio = ["dep:tokio-postgres"]
+postgres_sqlx = ["dep:sqlx", "sqlx/postgres"]
 
 [dependencies]
-async-trait = { version = "0.1.58" }
-
-tokio-postgres = { version = "0.7.7", default-features = false, optional = true }
-deadpool-postgres = { version = "0.10.3", default-features = false, optional = true }
-sqlx-core = { version = "0.6.2", default-features = false, optional = true }
+tokio-postgres = { version = "0.7.0", default-features = false, optional = true }
+sqlx = { version = "0.8.0", default-features = false, optional = true }
 
 [dev-dependencies]
 utilities = { path = "../utilities" }
 
-sqlx = { version = "0.6.2", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid"] }
-tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread", "net"] }
-tokio-postgres = { version = "0.7.7", features = ["with-uuid-1"] }
+sqlx = { version = "0.8.0", default-features = false, features = [
+	"runtime-tokio-rustls",
+	"postgres",
+	"derive",
+	"uuid",
+] }
+deadpool-postgres = { version = "0.14.1" }
+tokio = { version = "1.21.2", features = ["macros", "net"] }
+tokio-postgres = { version = "0.7.0", features = ["with-uuid-1"] }
 
-uuid = { version = "1.2.1", features = ["v4"] }
+uuid = { version = "1.16.0", features = ["v4", "v7"] }
 
 [[example]]
 name = "pg_deadpool"
 path = "examples/pg_deadpool.rs"
 test = true
-required-features = [
-	"pg_deadpool"
-]
+required-features = ["postgres_tokio"]
 
 [[example]]
 name = "sqlx"
 path = "examples/sqlx.rs"
 test = true
-required-features = [
-	"sqlx"
-]
+required-features = ["postgres_sqlx"]

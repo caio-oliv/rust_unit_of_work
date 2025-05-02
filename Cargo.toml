@@ -4,14 +4,10 @@ edition = "2021"
 authors = ["Caio Oliveira <caio.vsoliveira23@gmail.com>"]
 license = "MIT"
 readme = "readme.md"
-rust-version = "1.65"
+rust-version = "1.86"
 
 [workspace]
-members = [
-	"abstract_db_access",
-	"utilities"
-]
+resolver = "2"
 
-default-members = [
-	"abstract_db_access"
-]
+default-members = ["abstract_db_access"]
+members = ["abstract_db_access", "utilities"]

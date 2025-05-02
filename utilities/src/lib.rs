@@ -1,9 +1,7 @@
 pub mod env_var {
-    use lazy_static::lazy_static;
+    use std::sync::OnceLock;
 
-    lazy_static! {
-        static ref ENV_VAR: EnvVar = load_env();
-    }
+    static ENV_VAR: OnceLock<EnvVar> = OnceLock::new();
 
     #[derive(Debug, Clone)]
     pub struct EnvVar {
@@ -43,7 +41,7 @@ pub mod env_var {
     }
 
     pub fn get() -> &'static EnvVar {
-        &ENV_VAR
+        ENV_VAR.get_or_init(load_env)
     }
 }
 
@@ -66,7 +64,7 @@ pub mod connection {
         cfg.port(env.database_port);
         cfg.host(&env.database_host);
         cfg.connect_timeout(Duration::from_millis(5000));
-        cfg.application_name("UoW test".into());
+        cfg.application_name("UoW test");
         cfg.ssl_mode(tokio_postgres::config::SslMode::Prefer);
         cfg
     }
@@ -98,7 +96,7 @@ pub mod connection {
         config.password = cfg
             .get_password()
             .map(|pass| String::from_utf8(pass.into()).unwrap());
-        config.port = cfg.get_ports().iter().nth(0).copied();
+        config.port = cfg.get_ports().first().copied();
         config.host = Some(env.database_host.clone());
         config.connect_timeout = cfg.get_connect_timeout().cloned();
         config.application_name = Some("UoW test".into());
@@ -142,5 +140,23 @@ pub mod connection {
             .connect(&dburl)
             .await
             .unwrap()
+    }
+}
+
+pub mod database {
+    use sqlx::{Acquire, Executor};
+
+    pub async fn deadpool_setup_schema(pool: &deadpool_postgres::Pool, command: &str) {
+        let mut client = pool.get().await.unwrap();
+        let trx = client.transaction().await.unwrap();
+        trx.batch_execute(command).await.unwrap();
+        trx.commit().await.unwrap();
+    }
+
+    pub async fn sqlx_setup_schema(pool: &sqlx::PgPool, command: &str) {
+        let mut client = pool.acquire().await.unwrap();
+        let mut trx = client.begin().await.unwrap();
+        trx.execute(command).await.unwrap();
+        trx.commit().await.unwrap();
     }
 }
